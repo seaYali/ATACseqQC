@@ -1,0 +1,380 @@
+##########################################################################################
+#
+#
+#  Representative commands and scripts used for the ATACseqQC case study
+#  using HPC with a bash shell and a LSF job management system
+#
+#
+##########################################################################################
+
+
+
+##########################################################################################
+######### 1. download ATAC-seq data from GEO using ascp
+
+~/.aspera/connect/bin/ascp -T -l 100M -m 50M -k 1  -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh \
+    anonftp@ftp.ncbi.nlm.nih.gov:/sra/sra-instant/reads/ByExp/sra/SRX/SRX293/SRX2937358/SRR5720369/SRR5720369.sra   ./
+
+
+
+
+##########################################################################################
+######### 2. convert reads from the sra format to the fastq format
+
+fastq-dump  --split-files  -B -F  --gzip  SRR5720369.sra
+
+
+
+
+##########################################################################################
+######### 3. build index for the human reference genome GRCh38 (hg38)
+
+fasta=/project/umw_mccb/genome/Homo_sapiens/GRCh38/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+
+bwa index  $fasta
+
+
+
+
+##########################################################################################
+######### 4. align read to the human reference genome BWA-mem
+
+fasta=/project/umw_mccb/genome/Homo_sapiens/GRCh38/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+
+bwa mem -t 8   -M  $fasta SRR5720369_R1.fastq.gz  SRR5720369_R2.fastq.gz | samtools view \
+            -b -h  -o  SRR5720369.bam  -@ 8  -1  -
+
+
+
+
+##########################################################################################
+######## 5. filter alignments
+
+#!/bin/bash
+
+#BSUB -n 8 # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=16000] # ask for memory 16G
+#BSUB -W 12:00 #limit the job to be finished in 12 hours
+#BSUB -J "bwamem[1-25]"
+#BSUB -q long # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+
+
+module load samtools/1.4.1
+
+i=$(($LSB_JOBINDEX - 1))
+
+
+## "nuclear.chr.txt" is a file containing a list of all human chromosomes and unplaced scaffolds
+samtools view -H SRR5720369.bam | grep '^@SQ' |cut -f2 | perl -n -e 's/SN://; print if !/MT/'  > nuclear.chr.txt
+
+chromosomes=(`cat nuclear.chr.txt`)
+
+bam=(`ls *.bam `)
+names=(`ls *.bam| perl -p -e 's/.bam//' `)
+
+## sorting
+samtools sort -l 9 -m 8G  -o  ${names[${i}]}.sorted.bam  -O BAM -@ 8  ${names[${i}]}.bam
+samtools index  -@ 1  ${names[${i}]}.sorted.bam
+
+## statistics
+samtools flagstat -@ 8  ${names[${i}]}.sorted.bam  > ${names[${i}]}.prefilter.stat
+
+
+## removing mitochondrial reads 
+
+samtools view  -h   ${bam[${i}]}   'chrM' > ${names[${i}]}.MT.bam
+
+samtools flagstat -@ 8  ${names[${i}]}.MT.bam > ${names[${i}]}.MT.bam.stat
+
+## filtering by chromosome and mapping status
+
+samtools view  -h -O SAM  ${bam[${i}]}   ${chromosomes[@]} | awk  'BEGIN{FS=OFS="\t"} function abs(v) {return v < 0 ? -v : v}; /^@/ || ($7 == "="  \
+&& ($2 == 81 || $2 == 161|| $2 == 97 || $2 == 145 || $2 ==99 || $2 == 147 || $2 == 83 || $2 ==163) && abs($9) <= 2000 && abs($9) >= 38 && $5 >=20 ) {print}' | \
+   samtools view  -h  -b -o ${names[${i}]}.chr.filtered.bam  - 
+
+
+## sort and index
+
+samtools sort -l 9 -m 8G  -o  ${names[${i}]}.chr.filtered.sorted.bam  -O BAM -@ 8  ${names[${i}]}.chr.filtered.bam
+samtools index  -@ 1  ${names[${i}]}.chr.filtered.sorted.bam
+
+
+## statistics after removing mitochondrial reads
+
+samtools flagstat -@ 8  ${names[${i}]}.chr.filtered.sorted.bam > ${names[${i}]}.chr.filtered.sorted.bam.stat
+	
+## remove duplicates
+samtools rmdup  ${names[${i}]}.chr.filtered.sorted.bam  ${names[${i}]}.chr.filtered.sorted.rmdup.bam
+
+## index
+samtools index  -@ 1 ${names[${i}]}.chr.filtered.sorted.rmdup.bam
+
+
+
+
+
+##########################################################################################
+########### 6. Perform in silico QC using the ATACseqQC package
+
+## Get chromosome length information
+samtools view -H SRR5720369..sorted.bam | grep -P 'chr\d+|chrX' | cut -f2,3  | perl -n -e 's/[SL]N://g' | \
+        awk 'BEGIN{FS=OFS="\t"} {print $1, 1, $2, "hg38"}' > auto.x.chrom.human.txt
+
+
+##########################################################################################
+#################### 6.1 Creating ATACseqQC R scripts: ATACseqQC.R 
+
+#!/usr/bin/env Rscript
+
+## passing one BAM file for QC analysis. An index file per BAM file must be included in the same directory
+
+## Loading all required packages
+
+library(motifStack)
+library(ATACseqQC)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(MotifDb)
+library(ChIPpeakAnno)
+
+
+## Getting the BAM file name and sample ID
+args<- commandArgs(trailingOnly=TRUE)
+bamfile <- args[1]
+bamfile.sample.ID <- gsub(".bam", "", basename(bamfile))
+
+## Plotting size distribution of fragments (Figure 1G)
+pdf(paste0(bamfile.sample.ID, ".fragment.size.distribution.pdf"), width =10, height=8) 
+fragSize <- fragSizeDist(bamFiles=bamfile, bamFiles.labels=bamfile.sample.ID)
+dev.off()
+
+
+## BAM file tags to be included when read in by the Rsamtools
+tags <- c("AS", "NM", "MD")
+
+## Create a output directory where all subsequent BAM files will be output
+outPath <- paste0(bamfile.sample.ID, ".splited.bam")
+if (!dir.exists(outPath)){
+   dir.create(outPath)
+}
+
+## Build GRangs for the human genome hg38 excluding unplaced scaffoldsand chrY
+human.genome <- read.delim("auto.x.chrom.human.txt", header=F)
+
+seqlev <- as.character(human.genome[,1])
+gr <- GRanges(as.character(human.genome[,1]), IRanges(human.genome[,2], human.genome[,3]))
+
+## For QC, read alginments from chromosomes 1 and 2 are representatitive enough
+which <- gr[seqnames(gr) %in% c("chr1", "chr2")]
+  
+## Reading in paired end read alignment
+gal <- readBamFile(bamfile, tag=tags, which=which, asMates=TRUE)
+
+## Shifting the coordinates of 5' ends of the aligned reads in the bam file, +4 for reads mapping to the positive strand, -5 for reads mapping to the negative strand
+gal1 <- shiftGAlignmentsList(gal)
+shiftedBamfile <- file.path(outPath, paste0(bamfile,".shifted.bam"))
+
+## Outputting the shifted BAM file
+export(gal1, shiftedBamfile)
+
+## Getting information of known transcripts from UCSC genome browser database
+txs <- transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+
+## If the UCSC genome browser doesn't provide transcript information for your species, then create it as follows. Be cautious
+## with the chromosome identifiers used in different databases. Make sure they are consist with the reference genome you used.
+## properly modification might be necessary.
+## The makeTxDbFromGFF function allows the user to make a TxDb object from transcript annotations available as a GFF3 or GTF file.
+# txdb <- makeTxDbFromGFF(file ="~/project/umw_mccb/genome/Homo_sapiens/GRCh38/Homo_sapiens.GRCh38.89.gtf", format="gtf", 
+#             dataSource="ENSEMBL", organism="Homo sapiens", taxonomyId=NA, chrominfo=NULL, miRBaseBuild=NA,metadata=NULL)
+# txs <- transcripts(txdb)
+
+
+## Classifying reads into nucleosome-free, mono-, di- and tri-nucleosome bins based on their fragment sizes.
+genome <- Hsapiens
+objs <- splitGAlignmentsByCut(gal1, txs=txs, genome=genome)
+
+
+## output split BAM files
+null <- writeListOfGAlignments(objs, outPath)
+
+## Heatmap and coverage curve for nucleosome-free amd mono-, di- and tri-nucleosome occupied regions
+
+bamfiles <- file.path(outPath,
+                      c("NucleosomeFree.bam",
+                        "mononucleosome.bam",
+                        "dinucleosome.bam",
+                        "trinucleosome.bam"))
+
+## Extracting TSSs coordinates
+TSS <- promoters(txs, upstream=0, downstream=1)
+TSS <- unique(TSS)
+
+## Estimating the library size for normalization
+librarySize <- estLibSize(bamfiles)
+
+
+## Calculating the signals around TSSs.
+NTILE <- 101
+dws <- ups <- 1010
+
+sigs <- enrichedFragments(bamfiles, TSS=TSS,
+                          librarySize=librarySize,
+                          seqlev=seqlev,
+                          TSS.filter=0.5,
+                          n.tile = NTILE,
+                          upstream = ups,
+                          downstream = dws)
+                          
+                          
+## log2 transformed signals
+names(sigs) <- gsub(".bam", "", basename(names(sigs)))
+sigs.log2 <- lapply(sigs, function(.ele) log2(.ele+1))
+
+## Plotting heatmap showing signals  for nucleosome-free and oligonucleosome-bound regions around TSSs.  (Figure 1 H and 1I)
+pdf(paste0(bamfile.sample.ID, ".heatmap and averaged coverage.pdf"))
+featureAlignedHeatmap(sigs.log2, reCenterPeaks(TSS, width=ups+dws),
+                      zeroAt=.5, n.tile=NTILE)
+
+out <- featureAlignedDistribution(sigs, 
+                                  reCenterPeaks(TSS, width=ups+dws),
+                                  zeroAt=.5, n.tile=NTILE, type="l", yalb="Averaged coverage", ylab="Averaged coverage")
+dev.off()
+
+
+## Plotting CTCF footprints. (Figure 2C)
+CTCF <- query(MotifDb, c("CTCF"))
+CTCF <- as.list(CTCF)
+print(CTCF[[1]], digits=2)
+seqlev <- c("chr1", "chr2")
+
+nucleosome_free_bamfile <- file.path(outPath, "NucleosomeFree.bam")
+
+pdf(paste0(bamfile.sample.ID, ".CTCF.footprint.pdf"))
+factorFootprints(nucleosome_free_bamfile, pfm=CTCF[[1]], 
+                 genome=genome,
+                 min.score="95%", seqlev=seqlev,
+                 upstream=100, downstream=100)
+dev.off()
+
+
+
+
+##########################################################################################
+################ 6.2 run ATACseqQC.R with a filtered BAM file as the argument
+
+chmod +x  ATACseqQC.R
+
+#!/bin/bash
+
+#BSUB -n 1 # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=32000] # ask for memory 32G
+#BSUB -W 72:00 #limit the job to be finished in 72 hours
+#BSUB -J "ATACseqQC[1-4]"
+#BSUB -q long # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+
+mkdir -p logs
+
+bams=(`ls *.chr.filtered.sorted.rmdup.bam`)
+
+i=$(($LSB_JOBINDEX -1))
+
+./ATACseqQC.R  ${bams[${i}]}
+
+
+
+##########################################################################################
+################ 7. subsampling BAM files (SRR891270)
+
+#!/bin/bash
+
+#BSUB -n 8 # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=8000] # ask for memory 5G
+#BSUB -W 72:00 #limit the job to be finished in 12 hours
+#BSUB -J "subsample"
+#BSUB -q long # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+
+mkdir -p logs
+
+module load samtools/1.4.1
+
+samtools sort -l 9 -m 8G  -o  SRR891270.name.sorted.sam  -O SAM  -n -@ 8  SRR891270.chr.filtered.sorted.rmdup.bam
+
+
+## SAM header
+grep  -P '^@(HD|SQ|PG)'  SRR891270.name.sorted.sam  > SRR891270.name.sorted.sam.header
+
+
+## convert paired read alignment to a single line
+grep -v -P '^@(HD|SQ|PG)'  SRR891270.name.sorted.sam | awk 'BEGIN{FS=OFS="\t"; ORS="\t"; i =1} {if (i==1) {print $0; a=$1; i=i+1} else if ($1==a) {print $0; i= i+1} else if ($1 !=a) { print "\n"; print $0; i= i+1; a= $1}} END {print i > "SRR891270.total.number.of.fragments.txt"}'  |perl -p -e 's/^\t//; s/\t$//' >  SRR891270.name.sorted.oneliner.sam
+
+
+## subsampling using shuf
+
+total=`cat SRR891270.total.number.of.fragments.txt`
+
+
+subsample_size=(`echo "$total * 0.1" |bc | perl -p -e 's/\.\d+//'`  `echo "$total * 0.25" |bc | perl -p -e 's/\.\d+//'` `echo "$total * 0.5" |bc | perl -p -e 's/\.\d+//'`  `echo "$total * 0.75" |bc | perl -p -e 's/\.\d+//'`)
+percentage=(0.1 0.25 0.5 0.75)
+
+for i in ${seq 0 3}
+
+do
+	
+	file=SRR891270.name.sorted.${percentage[${i}]}.sam 
+	cp SRR891270.name.sorted.sam.header    $file
+	shuf -n  ${subsample_size[$i]}    SRR891270.name.sorted.oneliner.sam  >>  $file
+	
+	base=`basename $file .sam`
+    perl -p -e 's/\tHWI-ST/\nHWI-ST/' $file   | samtools view -b -h  -@ 8  -1  -  |  samtools sort  -l 9 -m 8G  -o  ${base}.coord.sorted.bam  -O BAM -@ 8 -
+    samtools index  -@ 1  ${base}.coord.sorted.bam
+
+done
+
+
+
+         
+#############################
+
+#!/bin/bash
+
+#BSUB -n 1 # minmal numbers of processors required for a parallel job
+#BSUB -R rusage[mem=8000] # ask for memory 5G
+#BSUB -W 4:00 #limit the job to be finished in 12 hours
+#BSUB -J "bwamem"
+#BSUB -q short  # which queue we want to run in
+#BSUB -o logs/out.%J.%I.txt # log
+#BSUB -e logs/err.%J.%I.txt # error
+#BSUB -R "span[hosts=1]" # All hosts on the same chassis"
+
+mkdir -p logs
+
+#SRR2721952  ATAC-seq_WT_retina_rep1; Mus musculus
+~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/002/SRR2721952/SRR2721952_1.fastq.gz   ./
+~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/002/SRR2721952/SRR2721952_2.fastq.gz   ./
+#
+#  
+#  #SRR2721954  ATAC-seq_WT_retina_rep2; Mus musculus
+#  #ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR272/004/SRR2721954/SRR2721954_1.fastq.gz   ./
+  ~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/004/SRR2721954/SRR2721954_2.fastq.gz   ./
+#
+#  #SRR2721959  ATAC-seq_NrlKO_retina_rep1; Mus musculus
+  ~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/009/SRR2721959/SRR2721959_1.fastq.gz   ./
+  ~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/009/SRR2721959/SRR2721959_2.fastq.gz   ./
+#
+#
+#  #SRR2721960  ATAC-seq_NrlKO_retina_rep2; Mus musculus
+  ~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/000/SRR2721960/SRR2721960_1.fastq.gz   ./
+  ~/.aspera/connect/bin/ascp  -QT -l 300m -P33001 -i ~/.aspera/connect/etc/asperaweb_id_dsa.openssh era-fasp@fasp.sra.ebi.ac.uk:/vol1/fastq/SRR272/000/SRR2721960/SRR2721960_2.fastq.gz   ./
+
+
+
