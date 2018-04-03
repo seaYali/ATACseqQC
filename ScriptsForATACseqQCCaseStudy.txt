@@ -86,13 +86,13 @@ samtools flagstat -@ 8  ${names[${i}]}.sorted.bam  > ${names[${i}]}.prefilter.st
 
 ## extract mitochondrial reads and summarize their mapping statistics
 
-samtools view  -h   ${bam[${i}]}   'chrM' > ${names[${i}]}.MT.bam
+samtools view  -h   ${bams[${i}]}   'chrM' > ${names[${i}]}.MT.bam
 
 samtools flagstat -@ 8  ${names[${i}]}.MT.bam > ${names[${i}]}.MT.bam.stat
 
 ## filtering BAM files to remove mitochondrial reads and other alignments of no interest
 
-samtools view  -h -O SAM  ${bam[${i}]}   ${chromosomes[@]} | awk  'BEGIN{FS=OFS="\t"} \
+samtools view  -h -O SAM  ${bams[${i}]}   ${chromosomes[@]} | awk  'BEGIN{FS=OFS="\t"} \
     function abs(v) {return v < 0 ? -v : v}; /^@/ || ($7 == "="  \
     && ($2 == 81 || $2 == 161|| $2 == 97 || $2 == 145 || $2 ==99 || \
     $2 == 147 || $2 == 83 || $2 ==163) && abs($9) <= 2000 && abs($9) >= 38 && $5 >=20 ) {print}' | \
