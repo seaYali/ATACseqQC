@@ -123,7 +123,7 @@ samtools index  -@ 1 ${names[${i}]}.chr.filtered.sorted.rmdup.bam
 ########### 6. Perform in silico QC using the ATACseqQC package
 
 ## Get chromosome length information
-samtools view -H SRR5720369.sorted.bam | grep -P 'chr\d+|chrX' | cut -f2,3  | perl -n -e 's/[SL]N://g' | \
+samtools view -H SRR5720369.sorted.bam | grep -P 'chr\d+|chrX' | cut -f2,3  | perl -p -e 's/[SL]N://g' | \
         awk 'BEGIN{FS=OFS="\t"} {print $1, 1, $2, "hg38"}' > auto.x.chrom.human.txt
 
 
