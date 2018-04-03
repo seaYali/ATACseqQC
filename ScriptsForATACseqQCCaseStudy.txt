@@ -68,7 +68,7 @@ i=$(($LSB_JOBINDEX - 1))
 
 
 ## "nuclear.chr.txt" is a file containing a list of all human chromosomes and unplaced scaffolds
-samtools view -H  SRR5720369.bam | grep '^@SQ'  |cut -f2 | perl -n -e 's/SN://; print if !/MT/'  > nuclear.chr.txt
+samtools view -H  SRR5720369.bam | grep '^@SQ'  |cut -f2 | perl -n -e 's/SN://; print if !/chrM/'  > nuclear.chr.txt
 
 chromosomes=(`cat nuclear.chr.txt`)
 
@@ -86,13 +86,13 @@ samtools flagstat -@ 8  ${names[${i}]}.sorted.bam  > ${names[${i}]}.prefilter.st
 
 ## extract mitochondrial reads and summarize their mapping statistics
 
-samtools view  -h   ${bams[${i}]}   'chrM' > ${names[${i}]}.MT.bam
+samtools view  -h   ${names[${i}]}.sorted.bam  'chrM' > ${names[${i}]}.MT.bam
 
 samtools flagstat -@ 8  ${names[${i}]}.MT.bam > ${names[${i}]}.MT.bam.stat
 
 ## filtering BAM files to remove mitochondrial reads and other alignments of no interest
 
-samtools view  -h -O SAM  ${bams[${i}]}   ${chromosomes[@]} | awk  'BEGIN{FS=OFS="\t"} \
+samtools view  -h -O SAM  ${names[${i}]}.sorted.bam   ${chromosomes[@]} | awk  'BEGIN{FS=OFS="\t"} \
     function abs(v) {return v < 0 ? -v : v}; /^@/ || ($7 == "="  \
     && ($2 == 81 || $2 == 161|| $2 == 97 || $2 == 145 || $2 ==99 || \
     $2 == 147 || $2 == 83 || $2 ==163) && abs($9) <= 2000 && abs($9) >= 38 && $5 >=20 ) {print}' | \
@@ -123,7 +123,7 @@ samtools index  -@ 1 ${names[${i}]}.chr.filtered.sorted.rmdup.bam
 ########### 6. Perform in silico QC using the ATACseqQC package
 
 ## Get chromosome length information
-samtools view -H SRR5720369.sorted.bam | grep -P 'chr\d+|chrX' | cut -f2,3  | perl -p -e 's/[SL]N://g' | \
+samtools view -H SRR5720369.sorted.bam | grep -P 'SN:' | cut -f2,3  | perl -p -e 's/[SL]N://g' | \
         awk 'BEGIN{FS=OFS="\t"} {print $1, 1, $2, "hg38"}' > auto.x.chrom.human.txt
 
 
@@ -149,8 +149,14 @@ args<- commandArgs(trailingOnly=TRUE)
 bamfile <- args[1]
 bamfile.sample.ID <- gsub(".bam", "", basename(bamfile))
 
+outPath <- paste0(bamfile.sample.ID, ".splited.bam")
+if (!dir.exists(outPath)){
+   dir.create(outPath)
+}
+
 ## Plotting size distribution of fragments (Figure 1G)
-pdf(paste0(bamfile.sample.ID, ".fragment.size.distribution.pdf"), width =10, height=8) 
+pdf(file.path(outPath, paste0(bamfile.sample.ID, ".fragment.size.distribution.pdf")),
+    width =10, height=8) 
 fragSize <- fragSizeDist(bamFiles=bamfile, bamFiles.labels=bamfile.sample.ID)
 dev.off()
 
@@ -159,10 +165,7 @@ dev.off()
 tags <- c("AS", "NM", "MD")
 
 ## Create a output directory where all subsequent BAM files will be output
-outPath <- paste0(bamfile.sample.ID, ".splited.bam")
-if (!dir.exists(outPath)){
-   dir.create(outPath)
-}
+
 
 ## Build GRangs for the human genome hg38 excluding unplaced scaffoldsand chrY
 human.genome <- read.delim("auto.x.chrom.human.txt", header=F)
@@ -188,9 +191,10 @@ export(gal1, shiftedBamfile)
 txs <- transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene)
 
 
-## Classifying reads into nucleosome-free, mono-, di- and tri-nucleosome bins based on their fragment sizes.
+## Classifying reads into nucleosome-free, mono-, di- and tri-nucleosome 
+## bins based on their fragment sizes. Don't use the machine learning option. TOO SLOW.
 genome <- Hsapiens
-objs <- splitGAlignmentsByCut(gal1, txs=txs, genome=genome)
+objs <- splitGAlignmentsByCut(gal1, txs=txs)
 
 
 ## output split BAM files
@@ -229,14 +233,16 @@ sigs <- enrichedFragments(bamfiles, TSS=TSS,
 names(sigs) <- gsub(".bam", "", basename(names(sigs)))
 sigs.log2 <- lapply(sigs, function(.ele) log2(.ele+1))
 
-## Plotting heatmap showing signals  for nucleosome-free and oligonucleosome-bound regions around TSSs.  (Figure 1 H and 1I)
+## Plotting heatmap showing signals  for nucleosome-free and oligonucleosome-bound 
+## regions around TSSs.  (Figure 1 H and 1I)
 pdf(paste0(bamfile.sample.ID, ".heatmap and averaged coverage.pdf"))
 featureAlignedHeatmap(sigs.log2, reCenterPeaks(TSS, width=ups+dws),
                       zeroAt=.5, n.tile=NTILE)
 
 out <- featureAlignedDistribution(sigs, 
                                   reCenterPeaks(TSS, width=ups+dws),
-                                  zeroAt=.5, n.tile=NTILE, type="l", yalb="Averaged coverage", ylab="Averaged coverage")
+                                  zeroAt=.5, n.tile=NTILE, type="l",
+				  ylab="Averaged coverage")
 dev.off()
 
 
