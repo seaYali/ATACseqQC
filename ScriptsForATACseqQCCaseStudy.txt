@@ -281,7 +281,7 @@ chmod +x  ATACseqQC.R
 #BSUB -R "span[hosts=1]" # All hosts on the same chassis"
 
 mkdir -p logs
-
+module load R/3.4.0
 bams=(`ls *.chr.filtered.sorted.rmdup.bam`)
 
 i=$(($LSB_JOBINDEX -1))
